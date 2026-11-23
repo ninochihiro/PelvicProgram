@@ -1,0 +1,33 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+.arduino-*
+__pycache__
+*.pyc
+analysis/asset-backups/
+analysis/creep_diagnostic/output/
+data/auth-users.json
+data/auth-users.json.tmp
+data/touch-thresholds.json
+data/touch-thresholds.json.tmp
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
