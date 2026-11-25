@@ -221,12 +221,24 @@ MPPS Web 5173 (Local Subnet)
 - 普通用户账号由管理员在“用户管理”中创建。
 - 串口 WebSocket 连接同样要求有效登录会话。
 
-首次初始化时，如果 `data/auth-users.json` 中还没有管理员，服务端会创建
-默认管理员：
+账号和训练成绩统一保存在 SQLite 数据库：
+
+```text
+data/pelvic-program.db
+```
+
+数据库包含 `users` 和 `training_results` 两张表。首次启动时，如果数据库还没有
+账号，服务端会把旧 `data/auth-users.json` 自动迁移到 SQLite。训练完成后，
+准确性训练、全面性训练和模拟考场成绩会自动写入数据库，管理员可在“用户管理”
+页面查看最近成绩。
+
+SQLite 使用 Node.js 内置的 `node:sqlite`，因此需要 Node.js 22.5 或更高版本。
+
+首次初始化时，如果没有管理员账号，服务端会创建默认管理员：
 
 ```text
 用户名：admin
-密码：Admin@123456
+密码：123
 ```
 
 部署前建议通过环境变量覆盖默认值：
@@ -237,5 +249,5 @@ $env:PELVIC_ADMIN_PASSWORD = 'A-strong-password'
 npm start
 ```
 
-密码使用随机盐和 `scrypt` 哈希保存，登录令牌有效期为 12 小时。
-`data/auth-users.json` 已加入 `.gitignore`，不应提交到版本库。
+密码使用随机盐和 `scrypt` 哈希保存在 SQLite 中，登录令牌有效期为 12 小时。
+`data/auth-users.json`、SQLite 数据库及 WAL 文件均已加入 `.gitignore`，不应提交到版本库。

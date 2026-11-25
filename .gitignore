@@ -17,6 +17,9 @@ analysis/asset-backups/
 analysis/creep_diagnostic/output/
 data/auth-users.json
 data/auth-users.json.tmp
+data/*.db
+data/*.db-shm
+data/*.db-wal
 data/touch-thresholds.json
 data/touch-thresholds.json.tmp
 *.local

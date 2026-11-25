@@ -35,6 +35,7 @@ import {
   calculateSinglePressThreshold,
   timeWeightedChannelMeans
 } from '../src/utils/sequentialThresholdCalibration.js'
+import { PelvicDatabase } from '../server/database.js'
 
 const legacyFrame = parseSerialFrame(Array(15).fill(1000).join(','))
 assert.ok(legacyFrame)
@@ -86,6 +87,47 @@ const firstLatch = updateChannelLatch(
 const heldLatch = updateChannelLatch([900, 100, 100], firstLatch.active, 800)
 assert.equal(strongestStartedChannel([900, 100, 100], firstLatch.started).index, 0)
 assert.equal(heldLatch.started.some(Boolean), false)
+const perChannelLatch = updateChannelLatch(
+  [500, 700, 900],
+  [false, false, false],
+  [600, 650, 1000],
+  [400, 420, 650]
+)
+assert.deepEqual(perChannelLatch.active, [false, true, false])
+assert.deepEqual(perChannelLatch.started, [false, true, false])
+
+const sqlite = new PelvicDatabase(':memory:')
+sqlite.initialize()
+const now = new Date().toISOString()
+const testUser = {
+  id: 'test-user-id',
+  username: 'tester',
+  displayName: '测试用户',
+  role: 'user',
+  salt: 'test-salt',
+  passwordHash: 'test-hash',
+  createdAt: now,
+  updatedAt: now,
+  lastLoginAt: null
+}
+sqlite.replaceUsers([testUser])
+assert.equal(sqlite.loadUsers()[0].username, 'tester')
+const savedResult = sqlite.createTrainingResult({
+  userId: testUser.id,
+  module: 'exam',
+  score: 88,
+  correctCount: 15,
+  wrongCount: 2,
+  totalCount: 17,
+  details: [{ targetId: 'coccyx', correct: true }],
+  startedAt: now,
+  completedAt: now
+})
+assert.equal(savedResult.username, 'tester')
+assert.equal(sqlite.listTrainingResults({ userId: testUser.id })[0].score, 88)
+sqlite.replaceUsers([])
+assert.equal(sqlite.listTrainingResults().length, 0)
+sqlite.close()
 
 for (const point of painPoints) {
   assert.equal(sameAnswer(point.code, point), true)

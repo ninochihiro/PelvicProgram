@@ -4,12 +4,15 @@ import {
   authState,
   createUser,
   deleteUser,
+  listTrainingResults,
   listUsers,
   updateUser
 } from '../utils/authClient'
 
 const users = ref([])
+const trainingResults = ref([])
 const loading = ref(false)
+const resultsLoading = ref(false)
 const errorMessage = ref('')
 const successMessage = ref('')
 const selectedResetUser = ref(null)
@@ -28,6 +31,19 @@ const userCount = computed(
 const adminCount = computed(
   () => users.value.filter((user) => user.role === 'admin').length
 )
+const averageScore = computed(() => {
+  if (!trainingResults.value.length) return '—'
+  const total = trainingResults.value.reduce(
+    (sum, result) => sum + Number(result.score || 0),
+    0
+  )
+  return Math.round((total / trainingResults.value.length) * 10) / 10
+})
+const moduleLabels = {
+  intensive: '准确性训练',
+  comprehensive: '全面性训练',
+  exam: '模拟考场'
+}
 
 function clearMessages() {
   errorMessage.value = ''
@@ -44,6 +60,21 @@ async function loadUsers() {
   } finally {
     loading.value = false
   }
+}
+
+async function loadResults() {
+  resultsLoading.value = true
+  try {
+    trainingResults.value = await listTrainingResults(200)
+  } catch (error) {
+    errorMessage.value = error.message
+  } finally {
+    resultsLoading.value = false
+  }
+}
+
+async function loadAdminData() {
+  await Promise.all([loadUsers(), loadResults()])
 }
 
 async function submitCreateUser() {
@@ -142,7 +173,15 @@ function formatDate(value) {
   })
 }
 
-onMounted(loadUsers)
+function formatScore(value) {
+  return Number.isFinite(Number(value))
+    ? Number(value).toLocaleString('zh-CN', {
+        maximumFractionDigits: 1
+      })
+    : '—'
+}
+
+onMounted(loadAdminData)
 </script>
 
 <template>
@@ -283,6 +322,68 @@ onMounted(loadUsers)
       </section>
     </main>
 
+    <section class="results-card">
+      <header class="results-heading">
+        <div>
+          <span>TRAINING RESULTS</span>
+          <h2>训练成绩记录</h2>
+          <p>成绩由 SQLite 数据库保存，按完成时间倒序显示最近 200 条。</p>
+        </div>
+        <div class="results-summary">
+          <div>
+            <strong>{{ trainingResults.length }}</strong>
+            <small>成绩记录</small>
+          </div>
+          <div>
+            <strong>{{ averageScore }}</strong>
+            <small>平均分</small>
+          </div>
+          <button
+            class="refresh-button"
+            type="button"
+            :disabled="resultsLoading"
+            @click="loadResults"
+          >
+            {{ resultsLoading ? '读取中…' : '刷新成绩' }}
+          </button>
+        </div>
+      </header>
+
+      <div v-if="trainingResults.length" class="table-wrap results-table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>完成时间</th>
+              <th>用户</th>
+              <th>训练模块</th>
+              <th>成绩</th>
+              <th>正确 / 错误 / 总数</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="result in trainingResults" :key="result.id">
+              <td>{{ formatDate(result.completedAt) }}</td>
+              <td>
+                <strong>{{ result.displayName }}</strong>
+                <small>{{ result.username }}</small>
+              </td>
+              <td>{{ moduleLabels[result.module] || result.module }}</td>
+              <td>
+                <b class="result-score">{{ formatScore(result.score) }}</b>
+              </td>
+              <td>
+                {{ result.correctCount }} / {{ result.wrongCount }} /
+                {{ result.totalCount }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div v-else class="results-empty">
+        {{ resultsLoading ? '正在读取成绩记录…' : '数据库中还没有训练成绩。' }}
+      </div>
+    </section>
+
     <section v-if="selectedResetUser" class="reset-panel">
       <div>
         <span>RESET PASSWORD</span>
@@ -323,6 +424,7 @@ onMounted(loadUsers)
 .admin-header,
 .admin-grid,
 .message,
+.results-card,
 .reset-panel {
   width: min(1420px, 100%);
   margin-inline: auto;
@@ -343,6 +445,7 @@ onMounted(loadUsers)
 .eyebrow,
 .create-card header > span,
 .users-heading span,
+.results-heading span,
 .reset-panel > div > span {
   color: #65dfc3;
   font-size: 11px;
@@ -418,7 +521,8 @@ onMounted(loadUsers)
 }
 
 .create-card,
-.users-card {
+.users-card,
+.results-card {
   padding: 22px;
   border: 1px solid #d9e3e9;
   border-radius: 16px;
@@ -433,6 +537,7 @@ onMounted(loadUsers)
 
 .create-card h2,
 .users-heading h2,
+.results-heading h2,
 .reset-panel h2 {
   margin: 6px 0 4px;
   font-size: 23px;
@@ -604,6 +709,73 @@ button:disabled {
   min-width: 220px;
 }
 
+.results-card {
+  margin-top: 16px;
+}
+
+.results-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.results-heading p {
+  margin: 4px 0 0;
+  color: #728594;
+  font-size: 12px;
+}
+
+.results-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.results-summary > div {
+  min-width: 92px;
+  padding: 8px 11px;
+  border-radius: 9px;
+  background: #f1f6f8;
+  text-align: center;
+}
+
+.results-summary strong,
+.results-summary small {
+  display: block;
+}
+
+.results-summary strong {
+  color: #197d6b;
+  font-size: 20px;
+}
+
+.results-summary small {
+  color: #7b8d99;
+  font-size: 9px;
+}
+
+.results-table-wrap {
+  max-height: 430px;
+  overflow: auto;
+}
+
+.result-score {
+  color: #147b67;
+  font-size: 16px;
+}
+
+.results-empty {
+  display: grid;
+  min-height: 150px;
+  margin-top: 18px;
+  place-items: center;
+  border: 1px dashed #cfdde4;
+  border-radius: 11px;
+  color: #7d909d;
+  font-size: 13px;
+}
+
 @media (max-width: 1050px) {
   .admin-header,
   .reset-panel {
@@ -613,6 +785,11 @@ button:disabled {
 
   .admin-grid {
     grid-template-columns: 1fr;
+  }
+
+  .results-heading {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .reset-panel form {

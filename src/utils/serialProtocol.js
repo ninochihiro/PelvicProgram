@@ -96,13 +96,29 @@ export function subtractBaseline(values, baseline) {
 /**
  * Adds release hysteresis so a held touch is emitted only once.
  */
-export function updateChannelLatch(values, previousActive, threshold) {
-  const releaseThreshold = Math.max(1, threshold * 0.65)
-  const active = values.map((value, index) =>
-    previousActive?.[index]
-      ? value >= releaseThreshold
-      : value >= threshold
-  )
+export function updateChannelLatch(
+  values,
+  previousActive,
+  threshold,
+  releaseThreshold
+) {
+  const valueAt = (source, index) => {
+    const value = Number(
+      Array.isArray(source) ? source[index] : source
+    )
+    return Number.isFinite(value) ? value : Number.POSITIVE_INFINITY
+  }
+
+  const active = values.map((value, index) => {
+    const thresholdValue = valueAt(threshold, index)
+    const releaseValue =
+      releaseThreshold === undefined
+        ? Math.max(1, thresholdValue * 0.65)
+        : Math.max(1, valueAt(releaseThreshold, index))
+    return previousActive?.[index]
+      ? value >= releaseValue
+      : value >= thresholdValue
+  })
   const started = active.map(
     (isActive, index) => isActive && !previousActive?.[index]
   )

@@ -17,11 +17,13 @@ import {
   TOUCH_THRESHOLD_VERSION,
   normalizeTouchThresholdState
 } from './src/utils/touchThresholdCalibration.js'
+import { PelvicDatabase } from './server/database.js'
 
 const PORT = 8080
 const APP_ROOT = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = path.join(APP_ROOT, 'data')
 const USERS_FILE = path.join(DATA_DIR, 'auth-users.json')
+const DATABASE_FILE = path.join(DATA_DIR, 'pelvic-program.db')
 const TOUCH_THRESHOLDS_FILE = path.join(
   DATA_DIR,
   'touch-thresholds.json'
@@ -30,10 +32,18 @@ const SESSION_TTL_MS = 12 * 60 * 60 * 1000
 const LOGIN_WINDOW_MS = 5 * 60 * 1000
 const MAX_LOGIN_ATTEMPTS = 8
 const VALID_ROLES = new Set(['user', 'admin'])
+const VALID_TRAINING_MODULES = new Set([
+  'intensive',
+  'comprehensive',
+  'exam'
+])
 const DEFAULT_ADMIN_USERNAME =
   process.env.PELVIC_ADMIN_USERNAME?.trim() || 'admin'
 const DEFAULT_ADMIN_PASSWORD =
   process.env.PELVIC_ADMIN_PASSWORD || '123'
+
+const database = new PelvicDatabase(DATABASE_FILE)
+database.initialize()
 
 const users = []
 const sessions = new Map()
@@ -108,10 +118,7 @@ function createUserRecord({
 }
 
 async function persistUsers() {
-  await fs.mkdir(DATA_DIR, { recursive: true })
-  const tempPath = `${USERS_FILE}.tmp`
-  await fs.writeFile(tempPath, JSON.stringify(users, null, 2), 'utf8')
-  await fs.rename(tempPath, USERS_FILE)
+  database.replaceUsers(users)
 }
 
 async function persistTouchThresholdConfig(config) {
@@ -124,24 +131,29 @@ async function persistTouchThresholdConfig(config) {
 async function initializeAuthStore() {
   await fs.mkdir(DATA_DIR, { recursive: true })
 
-  try {
-    const content = await fs.readFile(USERS_FILE, 'utf8')
-    const storedUsers = JSON.parse(content)
-    if (Array.isArray(storedUsers)) {
-      users.push(
-        ...storedUsers.filter(
-          (user) =>
-            user?.id &&
-            user?.username &&
-            user?.passwordHash &&
-            user?.salt &&
-            VALID_ROLES.has(user.role)
+  const databaseUsers = database.loadUsers()
+  if (databaseUsers.length) {
+    users.push(...databaseUsers)
+  } else {
+    try {
+      const content = await fs.readFile(USERS_FILE, 'utf8')
+      const storedUsers = JSON.parse(content)
+      if (Array.isArray(storedUsers)) {
+        users.push(
+          ...storedUsers.filter(
+            (user) =>
+              user?.id &&
+              user?.username &&
+              user?.passwordHash &&
+              user?.salt &&
+              VALID_ROLES.has(user.role)
+          )
         )
-      )
-    }
-  } catch (error) {
-    if (error.code !== 'ENOENT') {
-      console.warn(`账号数据读取失败，将重新初始化: ${error.message}`)
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        console.warn(`旧账号数据读取失败，将重新初始化: ${error.message}`)
+      }
     }
   }
 
@@ -163,8 +175,8 @@ async function initializeAuthStore() {
       )
       createdDefaultAdmin = true
     }
-    await persistUsers()
   }
+  await persistUsers()
 }
 
 function createSession(user) {
@@ -256,6 +268,43 @@ function validateUsername(username) {
   }
 }
 
+function boundedInteger(value, fallback = 0) {
+  const number = Math.round(Number(value))
+  return Number.isFinite(number)
+    ? Math.min(100000, Math.max(0, number))
+    : fallback
+}
+
+function normalizeIsoDate(value, fallback = null) {
+  if (!value) return fallback
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? fallback : date.toISOString()
+}
+
+function normalizeTrainingResult(body) {
+  const module = String(body?.module ?? '')
+  if (!VALID_TRAINING_MODULES.has(module)) {
+    throw new Error('训练模块不正确')
+  }
+
+  const score = Number(body?.score)
+  if (!Number.isFinite(score) || score < 0 || score > 100) {
+    throw new Error('成绩必须在 0-100 之间')
+  }
+
+  return {
+    module,
+    score: Math.round(score * 10) / 10,
+    correctCount: boundedInteger(body?.correctCount),
+    wrongCount: boundedInteger(body?.wrongCount),
+    totalCount: boundedInteger(body?.totalCount),
+    details: Array.isArray(body?.details) ? body.details : [],
+    startedAt: normalizeIsoDate(body?.startedAt),
+    completedAt:
+      normalizeIsoDate(body?.completedAt) ?? new Date().toISOString()
+  }
+}
+
 function getLoginAttemptKey(request, username) {
   return `${request.socket.remoteAddress ?? 'local'}:${normalizeUsername(username)}`
 }
@@ -326,6 +375,22 @@ function requireAdmin(request, response) {
 async function handleAdminUsers(request, response, pathname) {
   const auth = requireAdmin(request, response)
   if (!auth) return
+
+  if (
+    pathname === '/api/admin/training-results' &&
+    request.method === 'GET'
+  ) {
+    const url = new URL(
+      request.url,
+      `http://${request.headers.host ?? 'localhost'}`
+    )
+    sendJson(response, 200, {
+      results: database.listTrainingResults({
+        limit: url.searchParams.get('limit')
+      })
+    })
+    return
+  }
 
   if (pathname === '/api/admin/users' && request.method === 'GET') {
     sendJson(response, 200, {
@@ -483,6 +548,46 @@ async function handleHttpRequest(request, response) {
           frontend: 5173,
           server: PORT
         }
+      })
+      return
+    }
+
+    if (
+      request.method === 'POST' &&
+      pathname === '/api/training/results'
+    ) {
+      const auth = getAuthenticatedRequest(request)
+      if (!auth) {
+        sendJson(response, 401, { error: '登录状态已失效，请重新登录' })
+        return
+      }
+      const result = normalizeTrainingResult(await readJsonBody(request))
+      const saved = database.createTrainingResult({
+        ...result,
+        userId: auth.user.id
+      })
+      sendJson(response, 201, { result: saved })
+      return
+    }
+
+    if (
+      request.method === 'GET' &&
+      pathname === '/api/training/results/mine'
+    ) {
+      const auth = getAuthenticatedRequest(request)
+      if (!auth) {
+        sendJson(response, 401, { error: '登录状态已失效，请重新登录' })
+        return
+      }
+      const url = new URL(
+        request.url,
+        `http://${request.headers.host ?? 'localhost'}`
+      )
+      sendJson(response, 200, {
+        results: database.listTrainingResults({
+          userId: auth.user.id,
+          limit: url.searchParams.get('limit')
+        })
       })
       return
     }
@@ -775,6 +880,7 @@ function handleServerStartupError(error) {
   } else {
     console.error(`本地服务启动失败: ${error.message}`)
   }
+  database.close()
   process.exit(1)
 }
 
@@ -867,5 +973,10 @@ process.on('SIGINT', async () => {
     closeSerialChannel('sensor'),
     closeSerialChannel('pressure')
   ])
-  wss.close(() => httpServer.close(() => process.exit(0)))
+  wss.close(() =>
+    httpServer.close(() => {
+      database.close()
+      process.exit(0)
+    })
+  )
 })

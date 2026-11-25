@@ -154,3 +154,25 @@ export async function saveTouchThresholdConfig(config) {
     body: JSON.stringify({ config })
   })
 }
+
+export async function saveTrainingResult(result) {
+  const payload = await requestJson('/api/training/results', {
+    method: 'POST',
+    body: JSON.stringify(result)
+  })
+  return payload.result
+}
+
+export async function getMyTrainingResults(limit = 100) {
+  const payload = await requestJson(
+    `/api/training/results/mine?limit=${encodeURIComponent(limit)}`
+  )
+  return payload.results
+}
+
+export async function listTrainingResults(limit = 200) {
+  const payload = await requestJson(
+    `/api/admin/training-results?limit=${encodeURIComponent(limit)}`
+  )
+  return payload.results
+}

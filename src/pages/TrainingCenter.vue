@@ -12,6 +12,10 @@ import PelvicModel from '../components/PelvicModel.vue'
 import TextPrompt from '../components/TextPrompt.vue'
 import { createSerialSocket, listSerialPorts } from '../utils/serialSocket'
 import {
+  getTouchThresholdConfig,
+  saveTrainingResult
+} from '../utils/authClient'
+import {
   buildBaseline,
   parseSerialFrame,
   strongestStartedChannel,
@@ -27,6 +31,7 @@ import {
 } from '../data/pelvicTraining'
 
 const VALID_MODES = ['learning', 'intensive', 'comprehensive', 'exam']
+const LEARNING_HIGHLIGHT_HOLD_MS = 5000
 const modeModules = [
   {
     key: 'learning',
@@ -69,7 +74,25 @@ const initialMode = VALID_MODES.includes(String(route.query.mode))
 
 const mode = ref(initialMode)
 const modelRef = ref(null)
-const threshold = ref(800)
+const THRESHOLD_MODE_STORAGE_KEY = 'mpps-training-threshold-mode'
+const FIXED_THRESHOLD_STORAGE_KEY = 'mpps-training-fixed-threshold'
+const savedThresholdMode =
+  window.localStorage.getItem(THRESHOLD_MODE_STORAGE_KEY) === 'calibrated'
+    ? 'calibrated'
+    : 'fixed'
+const savedFixedThreshold = Number(
+  window.localStorage.getItem(FIXED_THRESHOLD_STORAGE_KEY)
+)
+const thresholdMode = ref(savedThresholdMode)
+const threshold = ref(
+  Number.isFinite(savedFixedThreshold) && savedFixedThreshold > 0
+    ? savedFixedThreshold
+    : 800
+)
+const perChannelThresholds = ref(Array(15).fill(null))
+const perChannelReleaseThresholds = ref(Array(15).fill(null))
+const thresholdConfigLoading = ref(false)
+const thresholdConfigError = ref('')
 const pressureValues = ref(Array(15).fill(0))
 const rawValues = ref(Array(15).fill(0))
 const baselineValues = ref(Array(15).fill(null))
@@ -85,17 +108,126 @@ const channelCooldownUntil = Array(15).fill(0)
 let calibrationFrames = []
 let calibrationTimer = null
 
+const perChannelThresholdReady = computed(() =>
+  perChannelThresholds.value.every(
+    (value) => Number.isFinite(value) && value > 0
+  )
+)
+const effectiveThresholds = computed(() =>
+  thresholdMode.value === 'fixed'
+    ? Array(15).fill(threshold.value)
+    : perChannelThresholds.value
+)
+const effectiveReleaseThresholds = computed(() =>
+  thresholdMode.value === 'fixed'
+    ? null
+    : perChannelReleaseThresholds.value
+)
 const activeChannels = computed(() =>
   pressureValues.value
     .map((value, index) => ({ index, value }))
-    .filter((item) => item.value >= threshold.value)
+    .filter(
+      (item) =>
+        Number.isFinite(effectiveThresholds.value[item.index]) &&
+        item.value >= effectiveThresholds.value[item.index]
+    )
     .sort((a, b) => b.value - a.value)
 )
 const currentModeMeta = computed(
   () => modeModules.find((item) => item.key === mode.value) ?? modeModules[0]
 )
 
-const selectedPoint = ref(painPoints[7])
+watch(threshold, (value) => {
+  window.localStorage.setItem(FIXED_THRESHOLD_STORAGE_KEY, String(value))
+})
+
+async function loadPerChannelThresholds() {
+  thresholdConfigLoading.value = true
+  thresholdConfigError.value = ''
+  try {
+    const payload = await getTouchThresholdConfig()
+    const channels = Array.isArray(payload?.config?.channels)
+      ? payload.config.channels
+      : []
+    const scale = Number.isFinite(Number(payload?.config?.scale))
+      ? Number(payload.config.scale)
+      : 1
+    perChannelThresholds.value = Array.from({ length: 15 }, (_, index) => {
+      const id = `A${String(index + 1).padStart(2, '0')}`
+      const channel = channels.find((item) => item?.id === id)
+      const value = Number(channel?.threshold)
+      return Number.isFinite(value) && value > 0
+        ? Math.max(1, Math.round(value * scale))
+        : null
+    })
+    perChannelReleaseThresholds.value = Array.from(
+      { length: 15 },
+      (_, index) => {
+        const id = `A${String(index + 1).padStart(2, '0')}`
+        const channel = channels.find((item) => item?.id === id)
+        const value = Number(channel?.releaseThreshold)
+        return Number.isFinite(value) && value >= 0
+          ? Math.max(1, Math.round(value * scale))
+          : null
+      }
+    )
+  } catch (error) {
+    thresholdConfigError.value = error.message
+    perChannelThresholds.value = Array(15).fill(null)
+    perChannelReleaseThresholds.value = Array(15).fill(null)
+  } finally {
+    thresholdConfigLoading.value = false
+  }
+}
+
+function openThresholdCalibration() {
+  router.push({
+    path: '/sensor',
+    query: { calibration: 'threshold' }
+  })
+}
+
+async function selectThresholdMode(nextMode) {
+  thresholdMode.value = nextMode === 'calibrated' ? 'calibrated' : 'fixed'
+  window.localStorage.setItem(
+    THRESHOLD_MODE_STORAGE_KEY,
+    thresholdMode.value
+  )
+  if (thresholdMode.value === 'calibrated') {
+    await loadPerChannelThresholds()
+    openThresholdCalibration()
+  }
+}
+
+function ensureThresholdReady() {
+  if (thresholdMode.value === 'fixed') return true
+  if (perChannelThresholdReady.value) return true
+  announce(
+    '当前使用校准阈值模式，请先前往传感工具完成 15 个通道的触觉标定。',
+    'warning',
+    '需要分通道标定'
+  )
+  return false
+}
+
+async function persistCompletedResult(module, payload) {
+  resultSaveState.status = 'saving'
+  resultSaveState.message = '正在保存成绩...'
+  try {
+    await saveTrainingResult({
+      module,
+      completedAt: new Date().toISOString(),
+      ...payload
+    })
+    resultSaveState.status = 'saved'
+    resultSaveState.message = '本次成绩已保存到数据库'
+  } catch (error) {
+    resultSaveState.status = 'error'
+    resultSaveState.message = `成绩保存失败：${error.message}`
+  }
+}
+
+const selectedPoint = ref(null)
 const selectedNoTouch = ref(null)
 const announcement = ref('')
 const popup = reactive({
@@ -106,6 +238,9 @@ const popup = reactive({
 })
 const popupQueue = []
 let popupTimer = null
+let learningHighlightTimer = null
+let learningHighlightFromPressure = false
+let learningHighlightLastSignalAt = 0
 
 const availablePorts = ref([])
 const selectedPortPath = ref('')
@@ -124,11 +259,23 @@ const practice = reactive({
   locked: false,
   correct: 0,
   wrong: 0,
-  completed: 0
+  completed: 0,
+  startedAt: null,
+  records: []
 })
 
 const foundPainChannels = ref([])
 const foundNoTouchIds = ref([])
+const comprehensiveSession = reactive({
+  startedAt: null,
+  records: [],
+  wrongCount: 0,
+  saved: false
+})
+const resultSaveState = reactive({
+  status: 'idle',
+  message: ''
+})
 
 const exam = reactive({
   running: false,
@@ -143,7 +290,9 @@ const exam = reactive({
   writtenChecked: false,
   writtenCorrect: false,
   wrongPoints: [],
-  records: []
+  records: [],
+  startedAt: null,
+  saved: false
 })
 
 const bonyPointIds = new Set([
@@ -225,6 +374,24 @@ const currentDetail = computed(() =>
   selectedNoTouch.value || selectedPoint.value
 )
 
+const learningAnnotation = computed(() => {
+  if (
+    mode.value !== 'learning' ||
+    selectedNoTouch.value ||
+    !selectedPoint.value
+  ) {
+    return null
+  }
+  return {
+    code: selectedPoint.value.code,
+    kicker: '痛点识别',
+    title: selectedPoint.value.title,
+    origin: selectedPoint.value.origin,
+    functions: selectedPoint.value.functions,
+    nodes: selectedPoint.value.nodes
+  }
+})
+
 const practiceTarget = computed(() => practice.order[practice.index] ?? null)
 
 const comprehensiveProgress = computed(() => {
@@ -262,7 +429,12 @@ watch(
 )
 
 watch(mode, (nextMode) => {
+  clearLearningHighlightTimer()
+  learningHighlightFromPressure = false
+  learningHighlightLastSignalAt = 0
   modelRef.value?.resetHighlight()
+  selectedPoint.value = null
+  selectedNoTouch.value = null
   pressureActive.value = Array(15).fill(false)
   channelCooldownUntil.fill(0)
 
@@ -312,15 +484,66 @@ function shuffle(items) {
   return result
 }
 
-function selectPoint(point) {
+function clearLearningHighlightTimer() {
+  if (learningHighlightTimer !== null) {
+    window.clearTimeout(learningHighlightTimer)
+    learningHighlightTimer = null
+  }
+}
+
+function clearLearningHighlight() {
+  clearLearningHighlightTimer()
+  learningHighlightFromPressure = false
+  learningHighlightLastSignalAt = 0
+  if (mode.value !== 'learning') return
+  selectedPoint.value = null
+  modelRef.value?.resetHighlight()
+}
+
+function scheduleLearningHighlightRelease(delay = LEARNING_HIGHLIGHT_HOLD_MS) {
+  clearLearningHighlightTimer()
+  learningHighlightTimer = window.setTimeout(() => {
+    learningHighlightTimer = null
+    const remaining =
+      LEARNING_HIGHLIGHT_HOLD_MS -
+      (performance.now() - learningHighlightLastSignalAt)
+    if (remaining > 0) {
+      scheduleLearningHighlightRelease(remaining)
+    } else {
+      clearLearningHighlight()
+    }
+  }, delay)
+}
+
+function selectPoint(point, { fromPressure = false } = {}) {
+  clearLearningHighlightTimer()
+  learningHighlightFromPressure = fromPressure
   selectedPoint.value = point
   selectedNoTouch.value = null
   modelRef.value?.highlightNodes(point.nodes)
-  announce(
-    `您目前按压的是${point.title}。${point.origin} 主要功能：${point.functions.join('、')}。`,
-    'info',
-    '痛点识别'
-  )
+  if (fromPressure) {
+    learningHighlightLastSignalAt = performance.now()
+    scheduleLearningHighlightRelease()
+  } else {
+    learningHighlightLastSignalAt = 0
+  }
+}
+
+function updateLearningHighlightHold(values) {
+  if (
+    mode.value !== 'learning' ||
+    !learningHighlightFromPressure ||
+    !selectedPoint.value
+  ) {
+    return
+  }
+  const channelValue = Number(values[selectedPoint.value.channel])
+  if (Number.isFinite(channelValue) && channelValue > 1) {
+    learningHighlightLastSignalAt = performance.now()
+    if (learningHighlightTimer === null) {
+      scheduleLearningHighlightRelease()
+    }
+  }
 }
 
 function selectNoTouch(region) {
@@ -334,6 +557,11 @@ function selectNoTouch(region) {
 }
 
 function selectComprehensivePoint(point) {
+  if (!comprehensiveSession.startedAt) {
+    comprehensiveSession.startedAt = new Date().toISOString()
+    resultSaveState.status = 'idle'
+    resultSaveState.message = ''
+  }
   selectedPoint.value = point
   selectedNoTouch.value = null
   comprehensiveTarget.value = { kind: 'pain', source: point }
@@ -347,6 +575,11 @@ function selectComprehensivePoint(point) {
 }
 
 function selectComprehensiveNoTouch(region) {
+  if (!comprehensiveSession.startedAt) {
+    comprehensiveSession.startedAt = new Date().toISOString()
+    resultSaveState.status = 'idle'
+    resultSaveState.message = ''
+  }
   selectedNoTouch.value = region
   comprehensiveTarget.value = { kind: 'noTouch', source: region }
   comprehensiveAnswer.value = ''
@@ -372,6 +605,15 @@ function checkComprehensiveAnswer() {
       : sameNoTouchAnswer(comprehensiveAnswer.value, source)
 
   if (!correct) {
+    comprehensiveSession.records.push({
+      targetId: source.id,
+      code: target.kind === 'pain' ? source.code : 'NO-TOUCH',
+      title: source.title,
+      kind: target.kind,
+      correct: false,
+      answer: comprehensiveAnswer.value
+    })
+    comprehensiveSession.wrongCount += 1
     announce(
       `名称不正确，请重新判断${target.kind === 'pain' ? '痛点所属结构' : '勿触区域名称'}。`,
       'error',
@@ -399,6 +641,14 @@ function checkComprehensiveAnswer() {
     )
   }
 
+  comprehensiveSession.records.push({
+    targetId: source.id,
+    code: target.kind === 'pain' ? source.code : 'NO-TOUCH',
+    title: source.title,
+    kind: target.kind,
+    correct: true,
+    answer: comprehensiveAnswer.value
+  })
   comprehensiveAnswer.value = ''
   comprehensiveTarget.value = null
   if (
@@ -410,6 +660,18 @@ function checkComprehensiveAnswer() {
       'success',
       '练习完成'
     )
+    if (!comprehensiveSession.saved) {
+      comprehensiveSession.saved = true
+      const total = painPoints.length + noTouchRegions.length
+      persistCompletedResult('comprehensive', {
+        score: Math.round((total / (total + comprehensiveSession.wrongCount)) * 100),
+        correctCount: total,
+        wrongCount: comprehensiveSession.wrongCount,
+        totalCount: total,
+        startedAt: comprehensiveSession.startedAt,
+        details: comprehensiveSession.records
+      })
+    }
   }
 }
 
@@ -583,11 +845,13 @@ function handleSerialLine(text) {
     ? subtractBaseline(frame.values, baselineValues.value)
     : frame.values
   pressureValues.value = values
+  updateLearningHighlightHold(values)
 
   const { active, started } = updateChannelLatch(
     values,
     pressureActive.value,
-    threshold.value
+    effectiveThresholds.value,
+    effectiveReleaseThresholds.value
   )
   pressureActive.value = active
 
@@ -610,11 +874,16 @@ function handleSerialLine(text) {
 
 function triggerPoint(point, value) {
   if (mode.value === 'learning') {
-    selectPoint(point)
+    selectPoint(point, { fromPressure: true })
     return
   }
 
   if (mode.value === 'comprehensive') {
+    if (!comprehensiveSession.startedAt) {
+      comprehensiveSession.startedAt = new Date().toISOString()
+      resultSaveState.status = 'idle'
+      resultSaveState.message = ''
+    }
     selectedPoint.value = point
     selectedNoTouch.value = null
     comprehensiveTarget.value = { kind: 'pain', source: point }
@@ -639,6 +908,7 @@ function triggerPoint(point, value) {
 }
 
 function startPractice() {
+  if (!ensureThresholdReady()) return
   if (!calibrated.value) {
     announce(
       '准确性练习需要先完成静置基线采集。请保持传感器无按压后重新校准。',
@@ -655,7 +925,11 @@ function startPractice() {
   practice.correct = 0
   practice.wrong = 0
   practice.completed = 0
+  practice.startedAt = new Date().toISOString()
+  practice.records = []
   practice.locked = false
+  resultSaveState.status = 'idle'
+  resultSaveState.message = ''
   loadPracticeQuestion()
 }
 
@@ -673,6 +947,16 @@ function loadPracticeQuestion() {
       'success',
       '练习完成'
     )
+    persistCompletedResult('intensive', {
+      score: Math.round(
+        (practice.correct / Math.max(1, practice.order.length)) * 100
+      ),
+      correctCount: practice.correct,
+      wrongCount: practice.wrong,
+      totalCount: practice.order.length,
+      startedAt: practice.startedAt,
+      details: practice.records
+    })
     return
   }
 
@@ -687,6 +971,15 @@ function handlePracticePressure(point) {
     practice.locked = true
     practice.correct++
     practice.completed++
+    practice.records.push({
+      targetId: target.id,
+      code: target.code,
+      title: target.title,
+      kind: target.kind,
+      correct: true,
+      attempts: practice.attempts + 1,
+      detectedChannel: point.channel
+    })
     practice.feedback = `正确：${target.title}`
     practice.reveal = false
     modelRef.value?.highlightNodes(target.nodes, 0x26b884)
@@ -701,6 +994,15 @@ function handlePracticePressure(point) {
 
   practice.attempts++
   practice.wrong++
+  practice.records.push({
+    targetId: target.id,
+    code: target.code,
+    title: target.title,
+    kind: target.kind,
+    correct: false,
+    attempts: practice.attempts,
+    detectedChannel: point.channel
+  })
   practice.feedback =
     `错误：检测到${point.title}，当前目标为${target.title}`
 
@@ -731,6 +1033,14 @@ function confirmPracticeNoTouch() {
   practice.locked = true
   practice.correct++
   practice.completed++
+  practice.records.push({
+    targetId: target.id,
+    code: 'NO-TOUCH',
+    title: target.source.title,
+    kind: target.kind,
+    correct: true,
+    attempts: 1
+  })
   practice.feedback = `${target.source.warning}：${target.title}`
   announce(
     `${target.title}，${target.source.warning}。${target.source.description}`,
@@ -748,6 +1058,12 @@ function nextPracticeQuestion() {
 function resetComprehensive() {
   foundPainChannels.value = []
   foundNoTouchIds.value = []
+  comprehensiveSession.startedAt = null
+  comprehensiveSession.records = []
+  comprehensiveSession.wrongCount = 0
+  comprehensiveSession.saved = false
+  resultSaveState.status = 'idle'
+  resultSaveState.message = ''
   selectedNoTouch.value = null
   comprehensiveTarget.value = null
   comprehensiveAnswer.value = ''
@@ -760,6 +1076,7 @@ function resetComprehensive() {
 }
 
 function startExam() {
+  if (!ensureThresholdReady()) return
   if (!calibrated.value) {
     announce(
       '模拟考场需要先完成静置基线采集。请保持传感器无按压后重新校准。',
@@ -783,6 +1100,10 @@ function startExam() {
   exam.writtenCorrect = false
   exam.wrongPoints = []
   exam.records = []
+  exam.startedAt = new Date().toISOString()
+  exam.saved = false
+  resultSaveState.status = 'idle'
+  resultSaveState.message = ''
   modelRef.value?.resetHighlight()
   announce(examTarget.value.prompt, 'info', '模拟考场')
 }
@@ -898,6 +1219,32 @@ function completeExamQuestion(record) {
     if (exam.index >= exam.order.length) {
       exam.running = false
       exam.completed = true
+      if (!exam.saved) {
+        exam.saved = true
+        const correctCount = exam.records.filter((record) =>
+          record.kind === 'noTouch'
+            ? record.writtenCorrect
+            : record.writtenCorrect && record.pressureCorrect
+        ).length
+        persistCompletedResult('exam', {
+          score: examScore.value,
+          correctCount,
+          wrongCount: Math.max(0, exam.records.length - correctCount),
+          totalCount: exam.records.length,
+          startedAt: exam.startedAt,
+          details: exam.records.map((record) => ({
+            targetId: record.target.id,
+            code: record.target.code,
+            title: record.target.title,
+            kind: record.kind,
+            writtenCorrect: record.writtenCorrect,
+            pressureCorrect: record.pressureCorrect,
+            attempts: record.attempts,
+            wrongPoints: record.wrongPoints,
+            revealed: record.revealed
+          }))
+        })
+      }
       announce(
         `模拟考场完成，最终得分 ${examScore.value} 分。请查看逐题答题结果。`,
         'success',
@@ -922,15 +1269,25 @@ function resetExam() {
   exam.writtenCorrect = false
   exam.reveal = false
   exam.wrongPoints = []
+  exam.startedAt = null
+  exam.saved = false
+  resultSaveState.status = 'idle'
+  resultSaveState.message = ''
   modelRef.value?.resetHighlight()
 }
 
-onMounted(connectSocket)
+onMounted(() => {
+  connectSocket()
+  if (thresholdMode.value === 'calibrated') {
+    loadPerChannelThresholds()
+  }
+})
 
 onBeforeUnmount(() => {
   clearTimeout(reconnectTimer)
   clearTimeout(calibrationTimer)
   clearTimeout(popupTimer)
+  clearLearningHighlightTimer()
   socket?.close()
 })
 </script>
@@ -1083,26 +1440,76 @@ onBeforeUnmount(() => {
             <span class="device-icon">THR</span>
             <div>
               <strong>触发灵敏度</strong>
-              <small>当前有 {{ activeChannels.length }} 路超过阈值</small>
+              <small>
+                {{
+                  thresholdMode === 'fixed'
+                    ? `固定阈值模式 · 当前有 ${activeChannels.length} 路超过阈值`
+                    : perChannelThresholdReady
+                      ? '分通道阈值已就绪'
+                      : '分通道阈值尚未完成'
+                }}
+              </small>
             </div>
             <i :class="{ online: activeChannels.length > 0 }"></i>
           </div>
-          <label class="threshold-setting">
-            <span>
-              触发阈值
-              <b>{{ threshold }}</b>
-            </span>
-            <input
-              v-model.number="threshold"
-              type="range"
-              min="100"
-              max="5000"
-              step="100"
-            />
-          </label>
-          <p class="device-note">
-            数值越高，需要更明显的按压才会触发。建议校准后再调整。
-          </p>
+
+          <div class="threshold-mode-selector" role="group" aria-label="阈值模式">
+            <button
+              type="button"
+              :class="{ active: thresholdMode === 'fixed' }"
+              @click="selectThresholdMode('fixed')"
+            >
+              固定阈值
+            </button>
+            <button
+              type="button"
+              :class="{ active: thresholdMode === 'calibrated' }"
+              @click="selectThresholdMode('calibrated')"
+            >
+              校准阈值
+            </button>
+          </div>
+
+          <template v-if="thresholdMode === 'fixed'">
+            <label class="threshold-setting">
+              <span>
+                触发阈值
+                <b>{{ threshold }}</b>
+              </span>
+              <input
+                v-model.number="threshold"
+                type="range"
+                min="100"
+                max="5000"
+                step="100"
+              />
+            </label>
+            <p class="device-note">
+              数值越高，需要更明显的按压才会触发；15 个通道共用这个阈值。
+            </p>
+          </template>
+
+          <div v-else class="calibrated-threshold-panel">
+            <div>
+              <span>分通道阈值</span>
+              <strong v-if="thresholdConfigLoading">正在读取…</strong>
+              <strong v-else-if="perChannelThresholdReady">15 / 15 已校准</strong>
+              <strong v-else>需要重新标定</strong>
+              <small v-if="thresholdConfigError" class="threshold-config-error">
+                {{ thresholdConfigError }}
+              </small>
+              <small v-else>
+                每个通道使用传感工具中保存的独立阈值。
+              </small>
+            </div>
+            <button
+              type="button"
+              class="secondary-button"
+              @click="openThresholdCalibration"
+            >
+              打开触觉标定
+            </button>
+          </div>
         </article>
       </div>
     </section>
@@ -1149,7 +1556,11 @@ onBeforeUnmount(() => {
           </div>
           <small>{{ activeChannels.length }} 路触发</small>
         </div>
-        <PelvicModel ref="modelRef" />
+        <PelvicModel
+          ref="modelRef"
+          :annotation="learningAnnotation"
+          :focus-nodes="learningAnnotation?.nodes ?? []"
+        />
         <div class="sensor-strip">
           <span
             v-for="(point, index) in painPoints"
@@ -1195,16 +1606,13 @@ onBeforeUnmount(() => {
             </button>
           </div>
 
-          <article class="detail-card" :class="{ danger: selectedNoTouch }">
-            <span>{{ selectedNoTouch ? 'NO-TOUCH REGION' : 'PAIN POINT' }}</span>
+          <article
+            v-if="selectedNoTouch"
+            class="detail-card danger"
+          >
+            <span>NO-TOUCH REGION</span>
             <h2>{{ currentDetail.title }}</h2>
-            <p>{{ selectedNoTouch?.description || selectedPoint.origin }}</p>
-            <template v-if="!selectedNoTouch">
-              <h3>主要功能</h3>
-              <ul>
-                <li v-for="item in selectedPoint.functions" :key="item">{{ item }}</li>
-              </ul>
-            </template>
+            <p>{{ selectedNoTouch.description }}</p>
           </article>
         </template>
 
@@ -1450,6 +1858,15 @@ onBeforeUnmount(() => {
             <button class="primary-button wide" @click="resetExam">重新考核</button>
           </template>
         </template>
+
+        <p
+          v-if="resultSaveState.message"
+          class="result-save-state"
+          :class="resultSaveState.status"
+          aria-live="polite"
+        >
+          {{ resultSaveState.message }}
+        </p>
 
         <section class="announcement-card">
           <span>文字提示记录</span>
@@ -1751,6 +2168,65 @@ onBeforeUnmount(() => {
 .threshold-setting input {
   width: 100%;
   accent-color: #32baa0;
+}
+
+.threshold-mode-selector {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin-top: 8px;
+  padding: 4px;
+  border: 1px solid #d8e2e8;
+  border-radius: 10px;
+  background: #eef3f5;
+}
+
+.threshold-mode-selector button {
+  min-height: 34px;
+  border: 0;
+  border-radius: 7px;
+  color: #64798a;
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.threshold-mode-selector button.active {
+  color: #0e5548;
+  background: #ffffff;
+  box-shadow: 0 2px 7px rgba(28, 68, 60, 0.1);
+}
+
+.calibrated-threshold-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.calibrated-threshold-panel > div {
+  display: grid;
+  gap: 3px;
+  padding: 10px 12px;
+  border: 1px solid #d8e5e8;
+  border-radius: 9px;
+  background: #f5faf9;
+}
+
+.calibrated-threshold-panel span,
+.calibrated-threshold-panel small {
+  color: #718494;
+  font-size: 10px;
+}
+
+.calibrated-threshold-panel strong {
+  color: #167a67;
+  font-size: 14px;
+}
+
+.calibrated-threshold-panel .threshold-config-error {
+  color: #a0444c;
 }
 
 .device-note {
@@ -2517,6 +2993,26 @@ onBeforeUnmount(() => {
 
 .announcement-card p {
   margin: 7px 0 0;
+}
+
+.result-save-state {
+  margin: 10px 0 0;
+  padding: 9px 11px;
+  border-radius: 9px;
+  color: #526d7d;
+  background: #edf3f6;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.result-save-state.saved {
+  color: #176f5e;
+  background: #eaf8f4;
+}
+
+.result-save-state.error {
+  color: #9b4149;
+  background: #fff0f1;
 }
 
 @media (max-width: 1250px) {

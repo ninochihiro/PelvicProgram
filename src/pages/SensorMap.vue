@@ -1856,6 +1856,10 @@ onMounted(() => {
 
   const params = new URLSearchParams(window.location.search)
   if (params.get('demo') === '1') startDemo()
+  if (params.get('calibration') === 'threshold') {
+    showCalibration.value = true
+    calibrationMode.value = 'threshold'
+  }
 })
 
 onBeforeUnmount(() => {
